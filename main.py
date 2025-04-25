@@ -2,18 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Cube ACR Recordings → Whisper → Firestore
-Drive 変更をポーリングし、その場で音声または JSON を処理して Firestore に保存。
+Drive 変更をポーリングし、その場で音声を文字起こし → 日付・電話番号抽出 → 要約生成 → Firestoreに保存
 """
 
-import json
 import os
 import io
+import json
 import logging
 import tempfile
 import uuid
+import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Tuple, Any, Dict
 
 from flask import Flask, request, jsonify, abort
 from google.cloud import firestore
@@ -24,20 +26,17 @@ import openai
 
 # ──────────────────── 環境変数 ────────────────────
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-FOLDER_ID      = os.environ["FOLDER_ID"]                # Drive フォルダ ID
+FOLDER_ID      = os.environ["FOLDER_ID"]
 SA_INFO        = json.loads(os.environ["DRIVE_SA_KEY_JSON"])
 
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 db            = firestore.Client()
-
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# JSON と AMR も許可
-SUPPORTED_EXT = {
-    "flac","m4a","mp3","mp4","mpeg","mpga",
-    "oga","ogg","wav","webm","amr","json"
-}
+# 音声のみ許可
+SUPPORTED_EXT = {"flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm","amr"}
+
 
 def get_drive() -> Any:
     creds = service_account.Credentials.from_service_account_info(
@@ -49,13 +48,12 @@ def get_drive() -> Any:
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+
 def clean_ext(name: str) -> str:
     return Path(name).suffix.lower().lstrip(" .")
 
+
 def download_from_drive(file_id: str, name: str) -> Tuple[str, str]:
-    """
-    Drive から DL → 必要なら AMR→MP3 変換 → (path, ext) を返す
-    """
     ext = clean_ext(name)
     if ext not in SUPPORTED_EXT:
         raise ValueError(f"unsupported ext: {ext}")
@@ -73,7 +71,6 @@ def download_from_drive(file_id: str, name: str) -> Tuple[str, str]:
     with open(original, "wb") as out_f:
         out_f.write(buf.getvalue())
 
-    # AMR は MP3 に変換して Whisper に投げる
     if ext == "amr":
         converted = os.path.join(tempdir, f"{uuid.uuid4()}.mp3")
         subprocess.run(
@@ -86,16 +83,49 @@ def download_from_drive(file_id: str, name: str) -> Tuple[str, str]:
 
     return original, ext
 
+
 def transcription(src_path: str) -> str:
-    """Whisper‐1 で文字起こし"""
+    """Whisper-1 で文字起こし"""
     with open(src_path, "rb") as f:
         resp = openai_client.audio.transcriptions.create(
             file=f, model="whisper-1"
         )
     return resp.text
 
+
+def summarize(text: str) -> str:
+    """文字起こし結果を要約"""
+    resp = openai_client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that summarizes transcribed phone call content."},
+            {"role": "user", "content": text}
+        ],
+        temperature=0.5,
+    )
+    return resp.choices[0].message.content
+
+
+def parse_filename(name: str) -> Tuple[str, datetime]:
+    """ファイル名から電話番号と録音日時を抽出"""
+    # 電話番号は先頭にある数字とハイフン
+    m_phone = re.match(r"^([\d-]+)", name)
+    if not m_phone:
+        raise ValueError(f"Phone number not found in filename: {name}")
+    phone = m_phone.group(1)
+
+    # 日付部分を YYYY-MM-DD HH-MM-SS 形式で抽出
+    m_date = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})", name)
+    if not m_date:
+        raise ValueError(f"Datetime not found in filename: {name}")
+    recorded_at = datetime.strptime(m_date.group(1), "%Y-%m-%d %H-%M-%S")
+
+    return phone, recorded_at
+
+
 def enqueue_record(meta: Dict[str, Any]) -> None:
     db.collection("recordings").add(meta)
+
 
 @app.post("/poll")
 def poll():
@@ -114,51 +144,41 @@ def poll():
             pageToken=token,
             spaces="drive",
             fields=(
-              "nextPageToken,"
-              "newStartPageToken,"
-              "changes(file(id,name,mimeType,parents))"
+                "nextPageToken,newStartPageToken,changes(file(id,name,mimeType,parents))"
             )
         ).execute()
 
         for ch in resp.get("changes", []):
             file = ch.get("file") or {}
             mime = file.get("mimeType", "")
-            # audio/ か JSON
-            if not (mime.startswith("audio/") or file.get("name","").lower().endswith(".json")):
+            if not mime.startswith("audio/"):
                 continue
-            # フォルダ親チェック
             if FOLDER_ID not in (file.get("parents") or []):
                 continue
 
             fid, name = file["id"], file["name"]
             try:
                 local, ext = download_from_drive(fid, name)
-
-                if ext == "json":
-                    # JSON なら直接読み込み
-                    data = json.load(open(local, encoding="utf-8"))
-                    text = data.get("text", data.get("transcript",""))
-                else:
-                    # audio → Whisper
-                    text = transcription(local)
+                text = transcription(local)
+                phone, recorded_at = parse_filename(name)
+                summary = summarize(text)
 
                 enqueue_record({
-                    "fileId"   : fid,
-                    "fileName" : name,
-                    "text"     : text,
-                    "status"   : "done",
-                    "createdAt": firestore.SERVER_TIMESTAMP,
+                    "fileId": fid,
+                    "fileName": name,
+                    "phoneNumber": phone,
+                    "recordedAt": recorded_at,
+                    "transcript": text,
+                    "summary": summary,
+                    "status": "done",
+                    "createdAt": firestore.SERVER_TIMESTAMP
                 })
                 polled += 1
                 logging.info("✅ success: %s", name)
             except Exception:
                 logging.exception("❌ failed: %s", name)
 
-        token = (
-            resp.get("newStartPageToken")
-            or resp.get("nextPageToken")
-            or token
-        )
+        token = resp.get("newStartPageToken") or resp.get("nextPageToken") or token
         if not resp.get("nextPageToken"):
             break
 
@@ -166,27 +186,30 @@ def poll():
     logging.info("polled=%s", polled)
     return jsonify({"polled": polled})
 
+
 @app.post("/webhook")
 def webhook():
-    data    = request.get_json(force=True)
-    fid     = data["fileId"]
-    name    = data["fileName"]
+    data = request.get_json(force=True)
+    fid  = data["fileId"]
+    name = data["fileName"]
     logging.info("▶️ start webhook: %s %s", fid, name)
 
     try:
         local, ext = download_from_drive(fid, name)
-        if ext == "json":
-            data = json.load(open(local, encoding="utf-8"))
-            text = data.get("text", data.get("transcript",""))
-        else:
-            text = transcription(local)
+        text = transcription(local)
+        phone, recorded_at = parse_filename(name)
+        summary = summarize(text)
 
         enqueue_record({
-            "fileId"   : fid,
-            "fileName" : name,
-            "text"     : text,
-            "status"   : "done",
-            "createdAt": firestore.SERVER_TIMESTAMP,
+            "fileId": fid,
+            "fileName": name,
+            "phoneNumber": phone,
+            "recordedAt": recorded_at,
+                    
+                    "transcript": text,
+                    "summary": summary,
+                    "status": "done",
+                    "createdAt": firestore.SERVER_TIMESTAMP
         })
         logging.info("✅ success")
         return jsonify({"ok": True})
@@ -194,5 +217,6 @@ def webhook():
         logging.exception("❌ webhook failed")
         abort(500)
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT","8080")), debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False)
