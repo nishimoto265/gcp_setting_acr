@@ -24,6 +24,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import openai
 
+# LangChain import
+from langchain import OpenAI as LcOpenAI, PromptTemplate, LLMChain
+
 # ──────────────────── 環境変数 ────────────────────
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 FOLDER_ID      = os.environ["FOLDER_ID"]
@@ -33,6 +36,14 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 db            = firestore.Client()
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# LangChain 要約チェーン設定
+summarize_prompt = PromptTemplate(
+    input_variables=["text"],
+    template="以下の通話内容を日本語で簡潔に要約してください：\n\n{text}"
+)
+llm = LcOpenAI(model_name="gpt-4o-mini", temperature=0.5)
+summarize_chain = LLMChain(llm=llm, prompt=summarize_prompt)
 
 # 音声のみ許可
 SUPPORTED_EXT = {"flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm","amr"}
@@ -85,36 +96,28 @@ def download_from_drive(file_id: str, name: str) -> Tuple[str, str]:
 
 
 def transcription(src_path: str) -> str:
-    """Whisper-1 で文字起こし"""
+    """Whisper-1 で文字起こし（日本語固定）"""
     with open(src_path, "rb") as f:
         resp = openai_client.audio.transcriptions.create(
-            file=f, model="whisper-1"
+            file=f,
+            model="whisper-1",
+            language="ja"
         )
     return resp.text
 
 
 def summarize(text: str) -> str:
-    """文字起こし結果を要約"""
-    resp = openai_client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant that summarizes transcribed phone call content."},
-            {"role": "user", "content": text}
-        ],
-        temperature=0.5,
-    )
-    return resp.choices[0].message.content
+    """LangChain を使った日本語要約"""
+    return summarize_chain.run(text)
 
 
 def parse_filename(name: str) -> Tuple[str, datetime]:
     """ファイル名から電話番号と録音日時を抽出"""
-    # 電話番号は先頭にある数字とハイフン
     m_phone = re.match(r"^([\d-]+)", name)
     if not m_phone:
         raise ValueError(f"Phone number not found in filename: {name}")
     phone = m_phone.group(1)
 
-    # 日付部分を YYYY-MM-DD HH-MM-SS 形式で抽出
     m_date = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})", name)
     if not m_date:
         raise ValueError(f"Datetime not found in filename: {name}")
@@ -203,14 +206,13 @@ def webhook():
         enqueue_record({
             "fileId": fid,
             "fileName": name,
-            "phoneNumber": phone,
-            "recordedAt": recorded_at,
-                    
+                    "phoneNumber": phone,
+                    "recordedAt": recorded_at,
                     "transcript": text,
                     "summary": summary,
                     "status": "done",
                     "createdAt": firestore.SERVER_TIMESTAMP
-        })
+                })
         logging.info("✅ success")
         return jsonify({"ok": True})
     except Exception:
