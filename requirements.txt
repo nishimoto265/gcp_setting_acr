@@ -11,4 +11,13 @@ google-cloud-firestore>=2.20.0
 openai>=1.3.0   # chat + whisper API 両対応
 requests>=2.31.0
 
-
+# ── LangChain ──
+langchain>=0.0.300
+# community 拡張。OpenAI LLM などを安全に動かすために必要
+langchain-community>=0.0.300
+# ── Firebase Admin SDK ──
+firebase-admin>=6.0.0
+# ── LangChain Google Generative AI integration ──
+langchain-google-genai>=0.0.2
+# requirements.txt に追加
+flask_cors>=4.0.0       # pip install flask-cors
