@@ -21,3 +21,8 @@ firebase-admin>=6.0.0
 langchain-google-genai>=0.0.2
 # requirements.txt に追加
 flask_cors>=4.0.0       # pip install flask-cors
+google-cloud-vision>=3.6.0
+# 追加分（まだ入れていなければ）
+google-cloud-documentai>=2.24.0
+opencv-python-headless>=4.9.0.80
+Pillow>=10.3.0
